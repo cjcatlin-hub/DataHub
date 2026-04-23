@@ -8,44 +8,79 @@ from pyspark.sql.functions import current_timestamp
 from pyspark.sql import Row
 
 # Initialise Variables
-source_table = "" # staging table
-target_table = "bronze." # bronze schema table
-key_column   = "" # UID col
-date_col   = "" # Date col to increment on
-snapshot_offset_days = -1 # Look back days
+source_table = "dbo.STAGE"
+target_table = "bronze.BRONZE"
+
+key_column = "UID"
+date_col = "DATECOL"
+snapshot_offset_days = -90
 
 # Load Tables
-staged = spark.table(source_table)  # Read only data frame
-target = DeltaTable.forName(spark, target_table) # Full access
+staged = spark.table(source_table)                 # Read-only DataFrame
+target = DeltaTable.forName(spark, target_table)   # Delta table reference
 
+# Column handling
+staged_cols = staged.columns
+target_cols = spark.table(target_table).columns
+
+# Only columns common to both staging and bronze
+common_cols = [c for c in staged_cols if c in target_cols]
+
+# Bronze-only system columns (not in staging)
+BRONZE_IS_DELETED = "IsDeleted"
+BRONZE_DELETED_DATE = "DeletedDate"
+
+# ============================================
 # Soft Delete Window
-snapshot_expr = f"date_add(current_date(), {snapshot_offset_days})" # Builds a SQL expression
+# ============================================
+snapshot_expr = f"date_add(current_date(), {snapshot_offset_days})"
 
+# ============================================
 # Merge
+# ============================================
 (
-    target.alias("t") # Bronze layer
+    target.alias("t")
     .merge(
-        staged.alias("s"), # Staging table
-        f"t.{key_column} = s.{key_column}" # Matching condition
+        staged.alias("s"),
+        f"t.{key_column} = s.{key_column}"
     )
+
+    # --------------------------------------------
+    # UPDATE: only update when LockVersion changes
+    # (does NOT touch bronze-only columns)
+    # --------------------------------------------
     .whenMatchedUpdate(
-        condition="s.LockVersion IS DISTINCT FROM t.LockVersion", # Only update when staging lock version is different to bronze lock version
-        set={c: f"s.{c}" for c in staged.columns}) # When UID = UID all the cols are updated - if previously deleted then deleted status is removed
-    .whenNotMatchedInsert(values={c: f"s.{c}" for c in staged.columns}) # New records from staging
-    .whenNotMatchedBySourceUpdate( # Records that exsist in the bronze layer but do not appear in staging (ie they have been deleted in source)
+        condition="s.LockVersion IS DISTINCT FROM t.LockVersion",
+        set={c: f"s.{c}" for c in common_cols}
+    )
+
+    # --------------------------------------------
+    # INSERT: explicitly set bronze system defaults
+    # --------------------------------------------
+    .whenNotMatchedInsert(
+        values={
+            **{c: f"s.{c}" for c in common_cols},
+            BRONZE_IS_DELETED: "false",
+            BRONZE_DELETED_DATE: "NULL"
+        }
+    )
+
+    # --------------------------------------------
+    # SOFT DELETE: missing from staging
+    # --------------------------------------------
+    .whenNotMatchedBySourceUpdate(
         condition=f"""
-            t.IsDeleted = false
+            t.{BRONZE_IS_DELETED} = false
             AND t.{date_col} >= {snapshot_expr}
         """,
         set={
-            "IsDeleted": "true",
-            "DeletedDate": "current_timestamp()"
+            BRONZE_IS_DELETED: "true",
+            BRONZE_DELETED_DATE: "current_timestamp()"
         }
     )
-    .execute() # Trigger the merge
-)
 
-print("Merge complete")
+    .execute()
+)
 
 # Merge metrics
 metrics = (
@@ -55,18 +90,19 @@ metrics = (
     .collect()[0]["operationMetrics"]
 )
 
-
 rows_inserted = int(metrics.get("numTargetRowsInserted", 0))
 rows_updated  = int(metrics.get("numTargetRowsUpdated", 0))
 rows_deleted  = int(metrics.get("numTargetRowsDeleted", 0))
-rows_written = rows_inserted + rows_updated + rows_deleted
+rows_written  = rows_inserted + rows_updated + rows_deleted
+stage_rows    = spark.talbe(staged).count()
 
-print("Merge metrics recorded")
-
-## Write merge metrics to logs
+# ============================================
+# Write merge metrics to logs
+# ============================================
 metrics_df = spark.createDataFrame([
     Row(
         target_table  = target_table,
+        stage_rows    = stage_rows,
         rows_inserted = rows_inserted,
         rows_updated  = rows_updated,
         rows_deleted  = rows_deleted,
@@ -74,8 +110,8 @@ metrics_df = spark.createDataFrame([
     )
 ]).withColumn("load_timestamp", current_timestamp())
 
-
-metrics_df.write.format("delta") \
+metrics_df.write \
+    .format("delta") \
     .mode("append") \
     .saveAsTable("dbo.merge_metrics")
 
@@ -83,5 +119,4 @@ metrics_df.write.format("delta") \
 spark.sql(f"OPTIMIZE {target_table}")
 spark.sql(f"VACUUM {target_table} RETAIN 168 HOURS")
 
-print("Optimize and vacuum done")
-print("Merge complete")
+print("Merge completed. Optimize + Vacuum done.")
