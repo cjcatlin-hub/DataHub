@@ -94,7 +94,7 @@ rows_inserted = int(metrics.get("numTargetRowsInserted", 0))
 rows_updated  = int(metrics.get("numTargetRowsUpdated", 0))
 rows_deleted  = int(metrics.get("numTargetRowsDeleted", 0))
 rows_written  = rows_inserted + rows_updated + rows_deleted
-stage_rows    = spark.talbe(staged).count()
+stage_rows    = staged.count()
 
 # ============================================
 # Write merge metrics to logs
